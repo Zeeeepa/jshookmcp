@@ -16,4 +16,23 @@ export interface ProcessHandlerDeps {
   platform: string;
 }
 
+export type MemoryDiagnosticsRequest = {
+  pid?: number;
+  address?: string;
+  size?: number;
+  operation: string;
+  error?: string;
+};
+
+export type MemoryAuditRecordInput = Omit<AuditEntry, 'timestamp' | 'user'>;
+
+export interface MemoryOperationHost {
+  readonly platformValue: string;
+  safeBuildMemoryDiagnostics(input: MemoryDiagnosticsRequest): Promise<unknown>;
+  recordMemoryAudit(entry: MemoryAuditRecordInput): void;
+  exportMemoryAuditEntries(): unknown[];
+  clearMemoryAuditEntries(): void;
+  getMemoryAuditCount(): number;
+}
+
 export type { AuditEntry };

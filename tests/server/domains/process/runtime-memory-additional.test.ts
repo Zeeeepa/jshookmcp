@@ -632,6 +632,20 @@ describe('ProcessToolHandlersMemory — additional coverage', () => {
       expect(body.success).toBe(false);
       expect(body.error).toContain('PID');
     });
+
+    it('validates addresses as a string array', async () => {
+      const body = parseJson<ProcessFindResponse>(
+        await handler.handleMemoryScanFiltered({
+          pid: 1234,
+          pattern: 'AA',
+          addresses: [1234],
+          patternType: 'hex',
+        }),
+      );
+
+      expect(body.success).toBe(false);
+      expect(body.error).toContain('addresses[0]');
+    });
   });
 
   // ── handleMemoryBatchWrite ───────────────────────────────────
@@ -677,6 +691,18 @@ describe('ProcessToolHandlersMemory — additional coverage', () => {
 
       expect(body.success).toBe(false);
       expect(body.error).toContain('PID');
+    });
+
+    it('validates batch patch encoding values', async () => {
+      const body = parseJson<ProcessFindResponse>(
+        await handler.handleMemoryBatchWrite({
+          pid: 1234,
+          patches: [{ address: '0x1000', data: 'AA', encoding: 'utf8' }],
+        }),
+      );
+
+      expect(body.success).toBe(false);
+      expect(body.error).toContain('patches[0].encoding');
     });
   });
 

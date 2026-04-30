@@ -8,8 +8,7 @@
 import { logger } from '@utils/logger';
 import { argNumber, argStringArray } from '@server/domains/shared/parse-args';
 import type { MemoryManager } from '@server/domains/shared/modules';
-import type { ProcessHandlerDeps } from './shared-types';
-import type { AuditEntry } from './shared-types';
+import type { AuditEntry, MemoryOperationHost, ProcessHandlerDeps } from './shared-types';
 import {
   validatePid,
   requireString,
@@ -19,7 +18,7 @@ import {
   type MemoryDiagnostics,
 } from '../handlers.base.types';
 
-export class ProcessManagementHandlers {
+export class ProcessManagementHandlers implements MemoryOperationHost {
   private processManager;
   private memoryManager;
   private platform: string;
@@ -156,6 +155,18 @@ export class ProcessManagementHandlers {
 
   get platformValue(): string {
     return this.platform;
+  }
+
+  exportMemoryAuditEntries(): unknown[] {
+    return JSON.parse(this.auditTrail.exportJson()) as unknown[];
+  }
+
+  clearMemoryAuditEntries(): void {
+    this.auditTrail.clear();
+  }
+
+  getMemoryAuditCount(): number {
+    return this.auditTrail.size();
   }
 
   // ── Process Handler Methods ──

@@ -3,8 +3,7 @@
  */
 
 import { logger } from '@utils/logger';
-import type { ProcessHandlerDeps } from './shared-types';
-import type { ProcessManagementHandlers } from './process-management';
+import type { MemoryOperationHost, ProcessHandlerDeps } from './shared-types';
 import {
   validatePid,
   requireString,
@@ -16,18 +15,31 @@ import {
   getWriteSize,
 } from '../handlers.base.types';
 
-export class MemoryOperationHandlers {
-  private memoryManager;
-  private platform: string;
-  private processMgmt: ProcessManagementHandlers;
+type AuditedMemoryOperation = 'memory_read' | 'memory_write' | 'memory_scan';
+type MemoryToolResponse = {
+  content: Array<{
+    type: 'text';
+    text: string;
+  }>;
+};
+type MemoryPatch = {
+  address: string;
+  data: string;
+  encoding?: 'hex' | 'base64';
+};
 
-  constructor(deps: ProcessHandlerDeps, processMgmt: ProcessManagementHandlers) {
+export class MemoryOperationHandlers {
+  private readonly memoryManager: ProcessHandlerDeps['memoryManager'];
+  private readonly platform: string;
+  private readonly host: MemoryOperationHost;
+
+  constructor(deps: ProcessHandlerDeps, host: MemoryOperationHost) {
     this.memoryManager = deps.memoryManager;
     this.platform = deps.platform;
-    this.processMgmt = processMgmt;
+    this.host = host;
   }
 
-  async handleMemoryRead(args: Record<string, unknown>) {
+  async handleMemoryRead(args: Record<string, unknown>): Promise<MemoryToolResponse> {
     const startedAt = Date.now();
     try {
       const pid = validatePid(args.pid);
@@ -36,215 +48,112 @@ export class MemoryOperationHandlers {
 
       const availability = await this.memoryManager.checkAvailability();
       if (!availability.available) {
-        return await this.unavailableResponse(
-          'memory_read',
+        return this.auditedUnavailableResponse({
+          operation: 'memory_read',
           pid,
           address,
           size,
           startedAt,
-          availability.reason,
-        );
+          reason: availability.reason,
+          extra: {
+            requestedAddress: address,
+            requestedSize: size,
+          },
+        });
       }
 
       const result = await this.memoryManager.readMemory(pid, address, size);
-      const diagnostics = !result.success
-        ? await this.processMgmt.safeBuildMemoryDiagnostics({
-            pid,
-            address,
-            size,
-            operation: 'memory_read',
-            error: result.error,
-          })
-        : undefined;
-      this.processMgmt.recordMemoryAudit({
+      return this.auditedResultResponse({
         operation: 'memory_read',
         pid,
         address,
         size,
-        result: result.success ? 'success' : 'failure',
-        error: result.error,
-        durationMs: Date.now() - startedAt,
+        startedAt,
+        result,
+        payload: {
+          success: result.success,
+          data: result.data,
+          error: result.error,
+          pid,
+          address,
+          size,
+          platform: this.platform,
+        },
       });
-
-      const payload: Record<string, unknown> = {
-        success: result.success,
-        data: result.data,
-        error: result.error,
-        pid,
-        address,
-        size,
-        platform: this.platform,
-      };
-
-      if (!result.success) {
-        payload.diagnostics = diagnostics;
-      }
-
-      return {
-        content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }],
-      };
     } catch (error) {
       logger.error('Memory read failed:', error);
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      const pid = getOptionalPid(args.pid);
-      const address = getOptionalString(args.address);
-      const size = getOptionalPositiveNumber(args.size);
-      const diagnostics = await this.processMgmt.safeBuildMemoryDiagnostics({
-        pid,
-        address,
-        size,
+      return this.auditedExceptionResponse({
         operation: 'memory_read',
-        error: errorMessage,
+        pid: getOptionalPid(args.pid) ?? null,
+        address: getOptionalString(args.address) ?? null,
+        size: getOptionalPositiveNumber(args.size) ?? null,
+        startedAt,
+        error,
       });
-      this.processMgmt.recordMemoryAudit({
-        operation: 'memory_read',
-        pid: pid ?? null,
-        address: address ?? null,
-        size: size ?? null,
-        result: 'failure',
-        error: errorMessage,
-        durationMs: Date.now() - startedAt,
-      });
-
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({ success: false, error: errorMessage, diagnostics }, null, 2),
-          },
-        ],
-      };
     }
   }
 
-  async handleMemoryWrite(args: Record<string, unknown>) {
+  async handleMemoryWrite(args: Record<string, unknown>): Promise<MemoryToolResponse> {
     const startedAt = Date.now();
     try {
       const pid = validatePid(args.pid);
       const address = requireString(args.address, 'address');
       const data = requireString(args.data, 'data');
-      const encoding = (args.encoding as 'hex' | 'base64') || 'hex';
+      const encoding = this.normalizeEncoding(args.encoding, 'encoding') ?? 'hex';
       const size = getWriteSize(data, encoding);
 
       const availability = await this.memoryManager.checkAvailability();
       if (!availability.available) {
-        const errorMessage = availability.reason ?? 'Memory operations not available';
-        const diagnostics = await this.processMgmt.safeBuildMemoryDiagnostics({
-          pid,
-          address,
-          size,
-          operation: 'memory_write',
-          error: errorMessage,
-        });
-        this.processMgmt.recordMemoryAudit({
+        return this.auditedUnavailableResponse({
           operation: 'memory_write',
           pid,
           address,
           size,
-          result: 'failure',
-          error: errorMessage,
-          durationMs: Date.now() - startedAt,
+          startedAt,
+          reason: availability.reason,
+          extra: {
+            requestedAddress: address,
+            dataLength: data.length,
+            encoding,
+          },
         });
-
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(
-                {
-                  success: false,
-                  message: 'Memory operations not available',
-                  reason: availability.reason,
-                  platform: this.platform,
-                  requestedAddress: address,
-                  dataLength: data !== undefined && data !== null ? data.length : 0,
-                  encoding,
-                  pid,
-                  diagnostics,
-                },
-                null,
-                2,
-              ),
-            },
-          ],
-        };
       }
 
       const result = await this.memoryManager.writeMemory(pid, address, data, encoding);
-      const diagnostics = !result.success
-        ? await this.processMgmt.safeBuildMemoryDiagnostics({
-            pid,
-            address,
-            size,
-            operation: 'memory_write',
-            error: result.error,
-          })
-        : undefined;
-      this.processMgmt.recordMemoryAudit({
+      return this.auditedResultResponse({
         operation: 'memory_write',
         pid,
         address,
         size,
-        result: result.success ? 'success' : 'failure',
-        error: result.error,
-        durationMs: Date.now() - startedAt,
+        startedAt,
+        result,
+        payload: {
+          success: result.success,
+          bytesWritten: result.bytesWritten,
+          error: result.error,
+          pid,
+          address,
+          dataLength: data.length,
+          encoding,
+          platform: this.platform,
+        },
       });
-
-      const payload: Record<string, unknown> = {
-        success: result.success,
-        bytesWritten: result.bytesWritten,
-        error: result.error,
-        pid,
-        address,
-        dataLength: data.length,
-        encoding,
-        platform: this.platform,
-      };
-
-      if (!result.success) {
-        payload.diagnostics = diagnostics;
-      }
-
-      return {
-        content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }],
-      };
     } catch (error) {
       logger.error('Memory write failed:', error);
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      const pid = getOptionalPid(args.pid);
-      const address = getOptionalString(args.address);
       const data = getOptionalString(args.data);
-      const encoding = (args.encoding as 'hex' | 'base64') || 'hex';
-      const size = data ? getWriteSize(data, encoding) : undefined;
-      const diagnostics = await this.processMgmt.safeBuildMemoryDiagnostics({
-        pid,
-        address,
-        size,
+      const encoding = this.normalizeEncoding(args.encoding, 'encoding') ?? 'hex';
+      return this.auditedExceptionResponse({
         operation: 'memory_write',
-        error: errorMessage,
+        pid: getOptionalPid(args.pid) ?? null,
+        address: getOptionalString(args.address) ?? null,
+        size: data ? getWriteSize(data, encoding) : null,
+        startedAt,
+        error,
       });
-      this.processMgmt.recordMemoryAudit({
-        operation: 'memory_write',
-        pid: pid ?? null,
-        address: address ?? null,
-        size: size ?? null,
-        result: 'failure',
-        error: errorMessage,
-        durationMs: Date.now() - startedAt,
-      });
-
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({ success: false, error: errorMessage, diagnostics }, null, 2),
-          },
-        ],
-      };
     }
   }
 
-  async handleMemoryScan(args: Record<string, unknown>) {
+  async handleMemoryScan(args: Record<string, unknown>): Promise<MemoryToolResponse> {
     const startedAt = Date.now();
     try {
       const pid = validatePid(args.pid);
@@ -254,200 +163,95 @@ export class MemoryOperationHandlers {
 
       const availability = await this.memoryManager.checkAvailability();
       if (!availability.available) {
-        const errorMessage = availability.reason ?? 'Memory operations not available';
-        const diagnostics = await this.processMgmt.safeBuildMemoryDiagnostics({
-          pid,
-          operation: 'memory_scan',
-          error: errorMessage,
-        });
-        this.processMgmt.recordMemoryAudit({
+        return this.auditedUnavailableResponse({
           operation: 'memory_scan',
           pid,
           address: null,
           size: null,
-          result: 'failure',
-          error: errorMessage,
-          durationMs: Date.now() - startedAt,
+          startedAt,
+          reason: availability.reason,
+          extra: {
+            requestedPattern: pattern,
+            patternType,
+          },
         });
-
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(
-                {
-                  success: false,
-                  message: 'Memory operations not available',
-                  reason: availability.reason,
-                  platform: this.platform,
-                  requestedPattern: pattern,
-                  patternType,
-                  pid,
-                  diagnostics,
-                },
-                null,
-                2,
-              ),
-            },
-          ],
-        };
       }
 
       const result = await this.memoryManager.scanMemory(pid, pattern, patternType, suspendTarget);
-      const diagnostics = !result.success
-        ? await this.processMgmt.safeBuildMemoryDiagnostics({
-            pid,
-            operation: 'memory_scan',
-            error: result.error,
-          })
-        : undefined;
-      this.processMgmt.recordMemoryAudit({
+      return this.auditedResultResponse({
         operation: 'memory_scan',
         pid,
         address: null,
         size: null,
-        result: result.success ? 'success' : 'failure',
-        error: result.error,
-        durationMs: Date.now() - startedAt,
+        startedAt,
+        result,
+        payload: {
+          success: result.success,
+          addresses: result.addresses,
+          error: result.error,
+          pid,
+          pattern,
+          patternType,
+          platform: this.platform,
+        },
       });
-
-      const payload: Record<string, unknown> = {
-        success: result.success,
-        addresses: result.addresses,
-        error: result.error,
-        pid,
-        pattern,
-        patternType,
-        platform: this.platform,
-      };
-
-      if (!result.success) {
-        payload.diagnostics = diagnostics;
-      }
-
-      return {
-        content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }],
-      };
     } catch (error) {
       logger.error('Memory scan failed:', error);
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      const pid = getOptionalPid(args.pid);
-      const diagnostics = await this.processMgmt.safeBuildMemoryDiagnostics({
-        pid,
+      return this.auditedExceptionResponse({
         operation: 'memory_scan',
-        error: errorMessage,
-      });
-      this.processMgmt.recordMemoryAudit({
-        operation: 'memory_scan',
-        pid: pid ?? null,
+        pid: getOptionalPid(args.pid) ?? null,
         address: null,
         size: null,
-        result: 'failure',
-        error: errorMessage,
-        durationMs: Date.now() - startedAt,
+        startedAt,
+        error,
       });
-
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({ success: false, error: errorMessage, diagnostics }, null, 2),
-          },
-        ],
-      };
     }
   }
 
-  async handleMemoryAuditExport(args: Record<string, unknown>) {
+  async handleMemoryAuditExport(args: Record<string, unknown>): Promise<MemoryToolResponse> {
     try {
-      const exportedJson = this.processMgmt['auditTrail'].exportJson();
-      const entries = JSON.parse(exportedJson) as unknown[];
+      const entries = this.host.exportMemoryAuditEntries();
       const clear = args.clear === true;
-      const count = this.processMgmt['auditTrail'].size();
+      const count = this.host.getMemoryAuditCount();
 
       if (clear) {
-        this.processMgmt['auditTrail'].clear();
+        this.host.clearMemoryAuditEntries();
       }
 
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({ success: true, count, cleared: clear, entries }, null, 2),
-          },
-        ],
-      };
+      return this.jsonResponse({
+        success: true,
+        count,
+        cleared: clear,
+        entries,
+      });
     } catch (error) {
       logger.error('Memory audit export failed:', error);
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(
-              { success: false, error: error instanceof Error ? error.message : String(error) },
-              null,
-              2,
-            ),
-          },
-        ],
-      };
+      return this.errorResponse(error);
     }
   }
 
-  async handleMemoryCheckProtection(args: Record<string, unknown>) {
+  async handleMemoryCheckProtection(args: Record<string, unknown>): Promise<MemoryToolResponse> {
     try {
       const pid = validatePid(args.pid);
       const address = requireString(args.address, 'address');
-
       const result = await this.memoryManager.checkMemoryProtection(pid, address);
-
-      return {
-        content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
-      };
+      return this.jsonResponse(result);
     } catch (error) {
       logger.error('Memory check protection failed:', error);
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(
-              { success: false, error: error instanceof Error ? error.message : String(error) },
-              null,
-              2,
-            ),
-          },
-        ],
-      };
+      return this.errorResponse(error);
     }
   }
 
-  async handleMemoryScanFiltered(args: Record<string, unknown>) {
+  async handleMemoryScanFiltered(args: Record<string, unknown>): Promise<MemoryToolResponse> {
     try {
       const pid = validatePid(args.pid);
       const pattern = requireString(args.pattern, 'pattern');
-      const addresses = args.addresses as string[];
+      const addresses = this.requireStringArray(args.addresses, 'addresses');
       const patternType = normalizePatternType(args.patternType);
 
       const availability = await this.memoryManager.checkAvailability();
       if (!availability.available) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(
-                {
-                  success: false,
-                  message: 'Memory operations not available',
-                  reason: availability.reason,
-                  platform: this.platform,
-                  pid,
-                },
-                null,
-                2,
-              ),
-            },
-          ],
-        };
+        return this.unavailableResponse(pid, availability.reason);
       }
 
       const result = await this.memoryManager.scanMemoryFiltered(
@@ -456,189 +260,246 @@ export class MemoryOperationHandlers {
         addresses,
         patternType,
       );
-
-      return {
-        content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
-      };
+      return this.jsonResponse(result);
     } catch (error) {
       logger.error('Memory scan filtered failed:', error);
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(
-              { success: false, error: error instanceof Error ? error.message : String(error) },
-              null,
-              2,
-            ),
-          },
-        ],
-      };
+      return this.errorResponse(error);
     }
   }
 
-  async handleMemoryBatchWrite(args: Record<string, unknown>) {
+  async handleMemoryBatchWrite(args: Record<string, unknown>): Promise<MemoryToolResponse> {
     try {
       const pid = validatePid(args.pid);
-      const patches = args.patches as {
-        address: string;
-        data: string;
-        encoding?: 'hex' | 'base64';
-      }[];
+      const patches = this.requirePatches(args.patches);
 
       const availability = await this.memoryManager.checkAvailability();
       if (!availability.available) {
-        return {
-          content: [
-            {
-              type: 'text',
-              text: JSON.stringify(
-                {
-                  success: false,
-                  message: 'Memory operations not available',
-                  reason: availability.reason,
-                  platform: this.platform,
-                  pid,
-                },
-                null,
-                2,
-              ),
-            },
-          ],
-        };
+        return this.unavailableResponse(pid, availability.reason);
       }
 
       const result = await this.memoryManager.batchMemoryWrite(pid, patches);
-
-      return {
-        content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
-      };
+      return this.jsonResponse(result);
     } catch (error) {
       logger.error('Memory batch write failed:', error);
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(
-              { success: false, error: error instanceof Error ? error.message : String(error) },
-              null,
-              2,
-            ),
-          },
-        ],
-      };
+      return this.errorResponse(error);
     }
   }
 
-  async handleMemoryDumpRegion(args: Record<string, unknown>) {
+  async handleMemoryDumpRegion(args: Record<string, unknown>): Promise<MemoryToolResponse> {
     try {
       const pid = validatePid(args.pid);
       const address = requireString(args.address, 'address');
       const size = requirePositiveNumber(args.size, 'size');
       const outputPath = requireString(args.outputPath, 'outputPath');
 
-      if (/^[/\\]/.test(outputPath) || /\.\./.test(outputPath) || /^[A-Za-z]:/.test(outputPath)) {
-        throw new Error(
-          'outputPath must be a relative path without parent directory traversal or drive letters',
-        );
-      }
+      this.ensureRelativeOutputPath(outputPath);
 
       const result = await this.memoryManager.dumpMemoryRegion(pid, address, size, outputPath);
-
-      return {
-        content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
-      };
+      return this.jsonResponse(result);
     } catch (error) {
       logger.error('Memory dump region failed:', error);
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(
-              { success: false, error: error instanceof Error ? error.message : String(error) },
-              null,
-              2,
-            ),
-          },
-        ],
-      };
+      return this.errorResponse(error);
     }
   }
 
-  async handleMemoryListRegions(args: Record<string, unknown>) {
+  async handleMemoryListRegions(args: Record<string, unknown>): Promise<MemoryToolResponse> {
     try {
       const pid = validatePid(args.pid);
-
       const result = await this.memoryManager.enumerateRegions(pid);
-
-      return {
-        content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
-      };
+      return this.jsonResponse(result);
     } catch (error) {
       logger.error('Memory list regions failed:', error);
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(
-              { success: false, error: error instanceof Error ? error.message : String(error) },
-              null,
-              2,
-            ),
-          },
-        ],
-      };
+      return this.errorResponse(error);
     }
   }
 
-  // ── Private helpers ──
-
-  private async unavailableResponse(
-    operation: 'memory_read',
-    pid: number,
-    address: string,
-    size: number,
-    startedAt: number,
-    reason?: string,
-  ) {
-    const errorMessage = reason ?? 'Memory operations not available';
-    const diagnostics = await this.processMgmt.safeBuildMemoryDiagnostics({
-      pid,
-      address,
-      size,
-      operation,
-      error: errorMessage,
-    });
-    this.processMgmt.recordMemoryAudit({
-      operation,
-      pid,
-      address,
-      size,
-      result: 'failure',
-      error: errorMessage,
-      durationMs: Date.now() - startedAt,
-    });
-
+  private jsonResponse(payload: unknown): MemoryToolResponse {
     return {
       content: [
         {
           type: 'text',
-          text: JSON.stringify(
-            {
-              success: false,
-              message: 'Memory operations not available',
-              reason,
-              platform: this.platform,
-              requestedAddress: address,
-              requestedSize: size,
-              pid,
-              diagnostics,
-            },
-            null,
-            2,
-          ),
+          text: JSON.stringify(payload, null, 2),
         },
       ],
     };
+  }
+
+  private errorResponse(error: unknown): MemoryToolResponse {
+    return this.jsonResponse({
+      success: false,
+      error: this.errorMessage(error),
+    });
+  }
+
+  private errorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+  }
+
+  private async auditedUnavailableResponse(params: {
+    operation: AuditedMemoryOperation;
+    pid: number;
+    address: string | null;
+    size: number | null;
+    startedAt: number;
+    reason?: string;
+    extra?: Record<string, unknown>;
+  }): Promise<MemoryToolResponse> {
+    const errorMessage = params.reason ?? 'Memory operations not available';
+    const diagnostics = await this.host.safeBuildMemoryDiagnostics({
+      pid: params.pid,
+      address: params.address ?? undefined,
+      size: params.size ?? undefined,
+      operation: params.operation,
+      error: errorMessage,
+    });
+
+    this.host.recordMemoryAudit({
+      operation: params.operation,
+      pid: params.pid,
+      address: params.address,
+      size: params.size,
+      result: 'failure',
+      error: errorMessage,
+      durationMs: Date.now() - params.startedAt,
+    });
+
+    return this.jsonResponse({
+      success: false,
+      message: 'Memory operations not available',
+      reason: params.reason,
+      platform: this.platform,
+      pid: params.pid,
+      ...params.extra,
+      diagnostics,
+    });
+  }
+
+  private async auditedResultResponse(params: {
+    operation: AuditedMemoryOperation;
+    pid: number;
+    address: string | null;
+    size: number | null;
+    startedAt: number;
+    result: {
+      success: boolean;
+      error?: string;
+    };
+    payload: Record<string, unknown>;
+  }): Promise<MemoryToolResponse> {
+    const diagnostics = !params.result.success
+      ? await this.host.safeBuildMemoryDiagnostics({
+          pid: params.pid,
+          address: params.address ?? undefined,
+          size: params.size ?? undefined,
+          operation: params.operation,
+          error: params.result.error,
+        })
+      : undefined;
+
+    this.host.recordMemoryAudit({
+      operation: params.operation,
+      pid: params.pid,
+      address: params.address,
+      size: params.size,
+      result: params.result.success ? 'success' : 'failure',
+      error: params.result.error,
+      durationMs: Date.now() - params.startedAt,
+    });
+
+    if (!params.result.success) {
+      params.payload.diagnostics = diagnostics;
+    }
+
+    return this.jsonResponse(params.payload);
+  }
+
+  private async auditedExceptionResponse(params: {
+    operation: AuditedMemoryOperation;
+    pid: number | null;
+    address: string | null;
+    size: number | null;
+    startedAt: number;
+    error: unknown;
+  }): Promise<MemoryToolResponse> {
+    const errorMessage = this.errorMessage(params.error);
+    const diagnostics = await this.host.safeBuildMemoryDiagnostics({
+      pid: params.pid ?? undefined,
+      address: params.address ?? undefined,
+      size: params.size ?? undefined,
+      operation: params.operation,
+      error: errorMessage,
+    });
+
+    this.host.recordMemoryAudit({
+      operation: params.operation,
+      pid: params.pid,
+      address: params.address,
+      size: params.size,
+      result: 'failure',
+      error: errorMessage,
+      durationMs: Date.now() - params.startedAt,
+    });
+
+    return this.jsonResponse({
+      success: false,
+      error: errorMessage,
+      diagnostics,
+    });
+  }
+
+  private unavailableResponse(pid: number, reason?: string): MemoryToolResponse {
+    return this.jsonResponse({
+      success: false,
+      message: 'Memory operations not available',
+      reason,
+      platform: this.platform,
+      pid,
+    });
+  }
+
+  private requireStringArray(value: unknown, fieldName: string): string[] {
+    if (!Array.isArray(value)) {
+      throw new Error(`${fieldName} must be an array of strings`);
+    }
+
+    return value.map((entry, index) => requireString(entry, `${fieldName}[${index}]`));
+  }
+
+  private requirePatches(value: unknown): MemoryPatch[] {
+    if (!Array.isArray(value)) {
+      throw new Error('patches must be an array');
+    }
+
+    return value.map((entry, index) => {
+      if (entry === null || typeof entry !== 'object') {
+        throw new Error(`patches[${index}] must be an object`);
+      }
+
+      const patch = entry as Record<string, unknown>;
+      const encoding = this.normalizeEncoding(patch.encoding, `patches[${index}].encoding`);
+      return {
+        address: requireString(patch.address, `patches[${index}].address`),
+        data: requireString(patch.data, `patches[${index}].data`),
+        ...(encoding ? { encoding } : {}),
+      };
+    });
+  }
+
+  private normalizeEncoding(value: unknown, fieldName: string): 'hex' | 'base64' | undefined {
+    if (value === undefined) {
+      return undefined;
+    }
+    if (value === 'hex' || value === 'base64') {
+      return value;
+    }
+    throw new Error(`${fieldName} must be "hex" or "base64"`);
+  }
+
+  private ensureRelativeOutputPath(outputPath: string): void {
+    if (/^[/\\]/.test(outputPath) || /\.\./.test(outputPath) || /^[A-Za-z]:/.test(outputPath)) {
+      throw new Error(
+        'outputPath must be a relative path without parent directory traversal or drive letters',
+      );
+    }
   }
 }
