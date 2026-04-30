@@ -4,154 +4,20 @@ import { argBool, argString } from '@server/domains/shared/parse-args';
 import type { ToolResponse } from '@server/types';
 import type { CrossDomainEvidenceBridge } from './handlers/evidence-graph-bridge';
 import { correlateSkiaToJS } from './handlers/skia-correlator';
-import type { SkiaSceneTree, JSObjectDescriptor } from './handlers/skia-correlator';
 import { correlateMojoToCDP } from './handlers/mojo-cdp-correlator';
-import type { MojoMessage, CDPEvent, NetworkRequest } from './handlers/mojo-cdp-correlator';
 import { correlateSyscallToJS } from './handlers/syscall-js-correlator';
-import type { SyscallEvent, JSStack, JSStackFrame } from './handlers/syscall-js-correlator';
 import { buildBinaryToJSPipeline } from './handlers/binary-to-js-pipeline';
-import type { GhidraOutput, GhidraFunction } from './handlers/binary-to-js-pipeline';
+import {
+  extractCDPEvents,
+  extractGhidraOutput,
+  extractJSObjectArray,
+  extractJSStacks,
+  extractMojoMessages,
+  extractNetworkRequests,
+  extractSkiaSceneTree,
+  extractSyscallEvents,
+} from './handlers/input-extractors';
 import { WORKFLOWS, type CrossDomainWorkflowDefinition } from './workflows/missions';
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object';
-}
-
-function extractSkiaSceneTree(value: unknown): SkiaSceneTree {
-  if (!isRecord(value)) {
-    return { layers: [], drawCommands: [] };
-  }
-  const layers: SkiaSceneTree['layers'] = Array.isArray(value['layers']) ? value['layers'] : [];
-  const drawCommands: SkiaSceneTree['drawCommands'] = Array.isArray(value['drawCommands'])
-    ? value['drawCommands']
-    : [];
-  return { layers, drawCommands };
-}
-
-function extractJSObjectArray(value: unknown): JSObjectDescriptor[] {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-  return value.filter(isRecord).map(
-    (item): JSObjectDescriptor => ({
-      objectId: typeof item['objectId'] === 'string' ? item['objectId'] : '',
-      className: typeof item['className'] === 'string' ? item['className'] : '',
-      name: typeof item['name'] === 'string' ? item['name'] : '',
-      stringProps: Array.isArray(item['stringProps'])
-        ? item['stringProps'].filter((s): s is string => typeof s === 'string')
-        : [],
-      numericProps: isRecord(item['numericProps'])
-        ? Object.fromEntries(
-            Object.entries(item['numericProps'] as Record<string, unknown>).filter(
-              (entry): entry is [string, number] => typeof entry[1] === 'number',
-            ),
-          )
-        : {},
-      colorProps: Array.isArray(item['colorProps'])
-        ? item['colorProps'].filter((s): s is string => typeof s === 'string')
-        : [],
-      urlProps: Array.isArray(item['urlProps'])
-        ? item['urlProps'].filter((s): s is string => typeof s === 'string')
-        : [],
-    }),
-  );
-}
-
-function extractMojoMessages(value: unknown): MojoMessage[] {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-  return value.filter(isRecord).map(
-    (item): MojoMessage => ({
-      interface: typeof item['interface'] === 'string' ? item['interface'] : '',
-      method: typeof item['method'] === 'string' ? item['method'] : '',
-      timestamp: typeof item['timestamp'] === 'number' ? item['timestamp'] : 0,
-      messageId: typeof item['messageId'] === 'string' ? item['messageId'] : '',
-    }),
-  );
-}
-
-function extractCDPEvents(value: unknown): CDPEvent[] {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-  return value.filter(isRecord).map(
-    (item): CDPEvent => ({
-      eventType: typeof item['eventType'] === 'string' ? item['eventType'] : '',
-      timestamp: typeof item['timestamp'] === 'number' ? item['timestamp'] : 0,
-      url: typeof item['url'] === 'string' ? item['url'] : undefined,
-    }),
-  );
-}
-
-function extractNetworkRequests(value: unknown): NetworkRequest[] {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-  return value.filter(isRecord).map(
-    (item): NetworkRequest => ({
-      requestId: typeof item['requestId'] === 'string' ? item['requestId'] : '',
-      url: typeof item['url'] === 'string' ? item['url'] : '',
-      timestamp: typeof item['timestamp'] === 'number' ? item['timestamp'] : 0,
-    }),
-  );
-}
-
-function extractSyscallEvents(value: unknown): SyscallEvent[] {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-  return value.filter(isRecord).map(
-    (item): SyscallEvent => ({
-      pid: typeof item['pid'] === 'number' ? item['pid'] : 0,
-      tid: typeof item['tid'] === 'number' ? item['tid'] : 0,
-      syscallName: typeof item['syscallName'] === 'string' ? item['syscallName'] : '',
-      timestamp: typeof item['timestamp'] === 'number' ? item['timestamp'] : 0,
-    }),
-  );
-}
-
-function extractJSStacks(value: unknown): JSStack[] {
-  if (!Array.isArray(value)) {
-    return [];
-  }
-  return value.filter(isRecord).map((item): JSStack => {
-    const frames: JSStack['frames'] = Array.isArray(item['frames'])
-      ? item['frames'].filter(isRecord).map(
-          (f): JSStackFrame => ({
-            functionName: typeof f['functionName'] === 'string' ? f['functionName'] : '',
-          }),
-        )
-      : [];
-    return {
-      threadId: typeof item['threadId'] === 'number' ? item['threadId'] : 0,
-      timestamp: typeof item['timestamp'] === 'number' ? item['timestamp'] : 0,
-      frames,
-    };
-  });
-}
-
-function extractGhidraOutput(value: unknown): GhidraOutput | null {
-  if (!isRecord(value)) {
-    return null;
-  }
-  const moduleName = typeof value['moduleName'] === 'string' ? value['moduleName'] : '';
-  if (!moduleName) {
-    return null;
-  }
-  const functionsRaw = Array.isArray(value['functions']) ? value['functions'] : [];
-  const functions: GhidraOutput['functions'] = functionsRaw.filter(isRecord).map(
-    (item): GhidraFunction => ({
-      name: typeof item['name'] === 'string' ? item['name'] : '',
-      moduleName: typeof item['moduleName'] === 'string' ? item['moduleName'] : '',
-      address: typeof item['address'] === 'string' ? item['address'] : undefined,
-      calledFrom: Array.isArray(item['calledFrom'])
-        ? item['calledFrom'].filter((c): c is string => typeof c === 'string')
-        : undefined,
-    }),
-  );
-  return { functions, moduleName };
-}
 
 const V5_DOMAIN_NAMES = [
   'analysis',

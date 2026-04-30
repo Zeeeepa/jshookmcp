@@ -1,5 +1,5 @@
 import type { DomainManifest, MCPServerContext } from '@server/domains/shared/registry';
-import { bindByDepKey, toolLookup } from '@server/domains/shared/registry';
+import { defineMethodRegistrations, toolLookup } from '@server/domains/shared/registry';
 import { crossDomainToolDefinitions } from './definitions';
 import type { CrossDomainHandlers, CrossDomainWorkflowClassifier } from './handlers';
 import type { CrossDomainEvidenceBridge } from './handlers/evidence-graph-bridge';
@@ -10,9 +10,22 @@ const DEP_KEY = 'crossDomainHandlers' as const;
 type Handlers = CrossDomainHandlers;
 
 const lookupTool = toolLookup(crossDomainToolDefinitions);
-const bindTool = (
-  invoke: (handlers: Handlers, args: Record<string, unknown>) => Promise<unknown>,
-) => bindByDepKey<Handlers>(DEP_KEY, invoke);
+const registrations = defineMethodRegistrations<
+  Handlers,
+  (typeof crossDomainToolDefinitions)[number]['name']
+>({
+  domain: DOMAIN,
+  depKey: DEP_KEY,
+  lookup: lookupTool,
+  entries: [
+    { tool: 'cross_domain_capabilities', method: 'handleCapabilities' },
+    { tool: 'cross_domain_suggest_workflow', method: 'handleSuggestWorkflow' },
+    { tool: 'cross_domain_health', method: 'handleHealth' },
+    { tool: 'cross_domain_correlate_all', method: 'handleCorrelateAll' },
+    { tool: 'cross_domain_evidence_export', method: 'handleEvidenceExport' },
+    { tool: 'cross_domain_evidence_stats', method: 'handleEvidenceStats' },
+  ],
+});
 
 async function ensure(ctx: MCPServerContext): Promise<CrossDomainHandlers> {
   const { ReverseEvidenceGraph } = await import('@server/evidence/ReverseEvidenceGraph');
@@ -118,38 +131,7 @@ const manifest = {
       weight: 0.7,
     },
   ],
-  registrations: [
-    {
-      tool: lookupTool('cross_domain_capabilities'),
-      domain: DOMAIN,
-      bind: bindTool((handlers, args) => handlers.handleCapabilities(args)),
-    },
-    {
-      tool: lookupTool('cross_domain_suggest_workflow'),
-      domain: DOMAIN,
-      bind: bindTool((handlers, args) => handlers.handleSuggestWorkflow(args)),
-    },
-    {
-      tool: lookupTool('cross_domain_health'),
-      domain: DOMAIN,
-      bind: bindTool((handlers) => handlers.handleHealth()),
-    },
-    {
-      tool: lookupTool('cross_domain_correlate_all'),
-      domain: DOMAIN,
-      bind: bindTool((handlers, args) => handlers.handleCorrelateAll(args)),
-    },
-    {
-      tool: lookupTool('cross_domain_evidence_export'),
-      domain: DOMAIN,
-      bind: bindTool((handlers) => handlers.handleEvidenceExport()),
-    },
-    {
-      tool: lookupTool('cross_domain_evidence_stats'),
-      domain: DOMAIN,
-      bind: bindTool((handlers) => handlers.handleEvidenceStats()),
-    },
-  ],
+  registrations,
 } satisfies DomainManifest<typeof DEP_KEY, Handlers, typeof DOMAIN>;
 
 export default manifest;
